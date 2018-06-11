@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import shutil
+import argparse
+from collections import defaultdict
+
+from git import Repo, Remote
+
+
+class GitRemote(Remote):
+
+    def __init__(self, remote):
+        self._remote = remote
+        self.source, self.org, self.repo = self.parse_url(remote.url)
+
+    def parse_url(self, url):
+        try:
+            for prefix, sep in [('git@', ':'), ('git://', '/'), ('http://', '/'), ('https://', '/')]:
+                if url.startswith(prefix):
+                    source, org_repo = url.replace(prefix, '').split(sep, 1)
+                    if org_repo.startswith('/'):
+                        org_repo = org_repo[1:]
+                    if len(org_repo.split('/')) == 1:
+                        org = None
+                        repo = org_repo.replace('.git', '')
+                    else:
+                        org, repo = org_repo.split('/')
+                        repo = repo.replace('.git', '')
+            return source, org, repo
+        except ValueError as e:
+            import pdb
+            pdb.set_trace()
+
+    @property
+    def path(self):
+        try:
+            parts = [self.source, self.org, self.repo]
+            return os.path.join(*[part for part in parts if part])
+        except AttributeError as e:
+            import pdb
+            pdb.set_trace()
+
+    def __getattr__(self, name):
+        return getattr(self._remote, name)
+
+class GitRepo(Repo):
+    _origin = None
+    _upstream = None
+
+    @property
+    def path(self):
+        if self.upstream:
+            return self.upstream.path
+        if self.origin:
+            return self.origin.path
+
+    @property
+    def origin(self):
+        if self._origin:
+            return self._origin
+        candidate = None
+        for remote in self.remotes:
+            if remote.name == 'origin':
+                candidate = remote
+            elif not candidate:
+                candidate = remote
+        if candidate:
+            self._origin = GitRemote(candidate)
+        return self._origin
+
+    @property
+    def upstream(self):
+        if self._upstream:
+            return self._upstream
+        candidate = None
+        for remote in self.remotes:
+            if remote.name == 'upstream':
+                candidate = remote
+            elif not candidate:
+                candidate = remote
+        if candidate:
+            self._upstream = GitRemote(candidate)
+        return self._upstream
+
+    def __repr__(self):
+        if self.upstream:
+            return "GitRepo[{0}]".format(self.upstream.path)
+        if self.origin:
+            return "GitRepo[{0}]".format(self.origin.path)
+        return "GitRepo[{0}]".format(self.working_dir)
+
+
+def write_mv_msg(src, dest):
+    path = os.path.join(src, '.env')
+    substrings = ["WARN This project has moved", "command -v fasd"]
+    new_lines = [
+        'echo "WARN This project has moved to {dest}"'.format(dest=dest),
+        'if [ "$(command -v fasd)" ] ; then fasd -D {src} && fasd -A {dest} ; fi'.format(src=src, dest=dest),
+    ]
+    original = []
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            original = f.readlines()
+
+    preserved = []
+    for line in original:
+        if not any([substring in line for substring in substrings]):
+            preserved.append(line)
+    msg = '\n'.join(preserved + new_lines)
+
+    with open(path, 'w') as f:
+        f.write(msg)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Reorganizes git repos into a consistent directory structure')
+    parser.add_argument('directories', metavar='DIR', nargs='+', type=str, help='Directories to search for git repos')
+    parser.add_argument('--dest', '-d', default=os.path.join(os.path.expanduser('~/'), 'projects'), help='The parent directory for the new directory structure')
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    repos = []
+    for path in args.directories:
+        for dirpath, dirnames, _ in os.walk(path):
+            if '.git' in dirnames:
+                repos.append(GitRepo(dirpath))
+
+    dedup = deduplicate(repos)
+
+    errors = defaultdict(lambda: defaultdict(lambda: {'dirty': False, 'untracked_files': [], 'failed': False}))
+
+    for path, repos in dedup.items():
+        if len(repos) == 1:
+            primary = repos[0]
+            src = primary.working_dir
+            dest = os.path.join(args.dest, path)
+            if src != dest:
+                if os.path.exists(dest):
+                    print("{0} already exists, skipping".format(path))
+                    write_mv_msg(src, dest)
+                else:
+                    print('Moving {0} to {1}'.format(src, dest))
+                    try:
+                        os.makedirs(os.path.abspath(os.path.join(dest, os.path.pardir)))
+                    except OSError:
+                        pass
+                    try:
+                        shutil.copytree(src, dest, symlinks=True)
+                        write_mv_msg(src, dest)
+                    except Exception as e:
+                        shutil.rmtree(dest, ignore_errors=True)
+                        errors[path][primary.working_dir]['failed'] = e
+        else:
+            for repo in repos:
+                if repo.is_dirty:
+                    errors[path][repo.working_dir]['dirty'] = True
+                if bool(repo.untracked_files):
+                    errors[path][repo.working_dir]['untracked_files'] = repo.untracked_files
+            if not errors[path]:
+                import pdb
+                pdb.set_trace()
+
+    print("\n\n-------------------------\n|ERRORS\n--------------------------")
+    for path, values in errors.items():
+        print("Can't create project at {0}, duplicates of the project must be cleaned up:".format(path))
+        for working_dir, value in values.items():
+            if value['dirty']:
+                print("\t {0} has uncommitted changes".format(working_dir))
+            if value['untracked_files']:
+                print("\t {0} has untracked files".format(working_dir))
+            if value['failed']:
+                print("\t {0} failed to copy: {1}".format(working_dir, value['failed']))
+
+
+def output(dedup):
+    for name, repos in sorted(dedup.items()):
+        primary = (list(filter(lambda x: x.upstream.url, repos)) or repos)[0]
+        print("{0} - {1} / {2} / {3}".format(name, primary.source, primary.org, primary.repo))
+        for repo in repos:
+            print("  - {0}".format(repo.working_dir))
+        print("")
+
+def deduplicate(repos):
+    dedup = defaultdict(lambda: [])
+    for repo in repos:
+        if repo.path:
+            dedup[repo.path].append(repo)
+        else:
+            print('Could not find identifiers for {}'.format(repo))
+    return dedup
+
+if __name__ == '__main__':
+    main()
